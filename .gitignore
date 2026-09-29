@@ -6,3 +6,7 @@ __pycache__/
 .env.*
 *.pem
 *.key
+
+# vdx demo artifacts
+/demo/output/
+/vdx
