@@ -32,10 +32,21 @@ go build -o vdex ./cmd/vdex
 ./vdex extract -version 1 -indices 0,3,7 -out part.json
 
 # 4. 接收方独立验证（不需要发布方的 store）
-./vdex verify -package part.json
+#    接收方必须通过可信渠道先固定：数据集名、版本号、该版本的 Merkle 根、
+#    以及本次要求的记录索引集合；包内自报的清单不能替代这些条件。
+ROOT=$(python3 -c 'import json;print(json.load(open("vdex-store/versions/v000000000002/manifest.json"))["root"])')
+./vdex verify -package part.json -dataset users -version 2 -root "$ROOT" -indices 0,3,7
 ```
 
 验证通过退出码为 0；任何篡改或拼接导致失败时退出码为 1。
+
+验证逐项绑定接收方目标，每一项未满足都会单独报错，而不是只检查剩余条目各自有效：
+
+- **名称/版本绑定**：包内清单改写数据集名或版本号即报 `dataset/version mismatch`。
+- **根绑定**：证明一律锚定接收方给定的可信根，包内自报根不被采信；根不同即报 `root mismatch`，跨版本拼接的条目证明无法还原到该根。
+- **期望集合完整**：包必须恰好携带 `-indices` 指定的记录。全删或部分缺失逐条报 `missing expected record`。
+- **多余/重复条目**：不在期望集合中的条目报 `extra record`，同一索引重复报 `duplicated index`。
+- **合法子集仍通过**：期望集合本身可以是任意部分索引（顺序任意、可重复），只要包恰好覆盖且证明锚定可信根。
 
 ## 产物布局
 

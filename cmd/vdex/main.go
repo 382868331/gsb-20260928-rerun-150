@@ -154,6 +154,10 @@ func cmdExtract(args []string) error {
 func cmdVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	path := fs.String("package", "package.json", "package file to verify")
+	dataset := fs.String("dataset", "", "REQUIRED trusted dataset name expected in the package")
+	version := fs.Uint64("version", 0, "REQUIRED trusted sealed version number")
+	rootHex := fs.String("root", "", "REQUIRED trusted Merkle root (hex), e.g. from 'seal' output")
+	indicesFlag := fs.String("indices", "", "REQUIRED comma-separated indices the receiver asked for, e.g. 0,3,7")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -161,13 +165,39 @@ func cmdVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	r := vdex.VerifyPackage(pkg)
+	if *dataset == "" || *version == 0 || *rootHex == "" || *indicesFlag == "" {
+		return errors.New("verify requires -dataset, -version, -root and -indices; values inside the package are not trusted")
+	}
+	rootBytes, err := hex.DecodeString(strings.TrimPrefix(*rootHex, "0x"))
+	if err != nil || len(rootBytes) != 32 {
+		return fmt.Errorf("-root must be a 32-byte hex digest: %w", err)
+	}
+	var wantRoot vdex.Hash
+	copy(wantRoot[:], rootBytes)
+	var wantIndices []uint64
+	for _, part := range strings.Split(*indicesFlag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return fmt.Errorf("bad expected index %q: %w", part, err)
+		}
+		wantIndices = append(wantIndices, i)
+	}
+	r := vdex.VerifyPackage(pkg, vdex.Expectation{
+		Dataset: *dataset,
+		Version: *version,
+		Root:    wantRoot,
+		Indices: wantIndices,
+	})
 	status := "INVALID"
 	if r.Valid {
 		status = "VALID"
 	}
-	fmt.Printf("%s  dataset=%s version=%d root=%s entries=%d/%d\n",
-		status, r.Dataset, r.Version, hex.EncodeToString(r.Root[:]), r.Entries, r.LeafCount)
+	fmt.Printf("%s  dataset=%s version=%d root=%s matched=%d/%d expected=%v present=%v\n",
+		status, r.Dataset, r.Version, hex.EncodeToString(r.Root[:]), r.Matched, len(r.Expected), r.Expected, r.Present)
 	for _, e := range r.Errors {
 		fmt.Fprintln(os.Stderr, "  -", e)
 	}

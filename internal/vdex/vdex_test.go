@@ -3,6 +3,7 @@ package vdex
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,33 +83,37 @@ func TestExtractAndVerify(t *testing.T) {
 	if len(pkg.Entries) != 2 {
 		t.Fatalf("duplicate requests should de-duplicate, got %d", len(pkg.Entries))
 	}
-	if r := VerifyPackage(pkg); !r.Valid {
+	m2, _ := store.LoadManifest(2)
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{0, 2}})
+	if !r.Valid {
 		t.Fatalf("package should verify: %v", r.Errors)
 	}
 }
 
 func TestVerifyDetectsTampering(t *testing.T) {
-	dir, _, _ := sealTwoVersions(t)
+	dir, m1, _ := sealTwoVersions(t)
 	pkg, err := NewStore(dir).Extract(1, []uint64{1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	pkg.Entries[0].Record = json.RawMessage(`{"id":999}`)
-	if r := VerifyPackage(pkg); r.Valid {
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 1, Root: m1.Root, Indices: []uint64{1}})
+	if r.Valid {
 		t.Fatal("tampered record must fail")
 	}
 }
 
 func TestVerifyDetectsCrossVersionSplice(t *testing.T) {
-	dir, _, _ := sealTwoVersions(t)
+	dir, m1, _ := sealTwoVersions(t)
 	store := NewStore(dir)
 	pkg1, _ := store.Extract(1, []uint64{0})
 	pkg2, _ := store.Extract(2, []uint64{3})
 	pkg1.Entries = append(pkg1.Entries, pkg2.Entries...)
-	r := VerifyPackage(pkg1)
+	r := VerifyPackage(pkg1, Expectation{Dataset: "demo", Version: 1, Root: m1.Root, Indices: []uint64{0, 3}})
 	if r.Valid {
 		t.Fatal("cross-version splice must fail")
 	}
+	assertErrContains(t, r, "entry 3")
 }
 
 func TestOldProofInvalidForNewVersion(t *testing.T) {
@@ -117,7 +122,8 @@ func TestOldProofInvalidForNewVersion(t *testing.T) {
 	m2, _ := store.LoadManifest(2)
 	pkg1, _ := store.Extract(1, []uint64{0})
 	pkg1.Manifest = m2
-	if r := VerifyPackage(pkg1); r.Valid {
+	r := VerifyPackage(pkg1, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{0}})
+	if r.Valid {
 		t.Fatal("old proofs must not validate under a new version root")
 	}
 }
@@ -147,14 +153,133 @@ func TestSealKeepsOldVersionAfterBadInput(t *testing.T) {
 }
 
 func TestPackageRoundTripFile(t *testing.T) {
-	dir, _, _ := sealTwoVersions(t)
+	dir, _, m2 := sealTwoVersions(t)
 	pkg, _ := NewStore(dir).Extract(2, []uint64{3})
 	path := filepath.Join(t.TempDir(), "pkg.json")
 	if err := WritePackage(path, pkg); err != nil {
 		t.Fatal(err)
 	}
 	got, err := ReadPackage(path)
-	if err != nil || !VerifyPackage(got).Valid {
-		t.Fatalf("file round trip must verify: %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := VerifyPackage(got, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{3}})
+	if !r.Valid {
+		t.Fatalf("file round trip must verify: %v", r.Errors)
+	}
+}
+
+func assertErrContains(t *testing.T, r VerifyResult, want string) {
+	t.Helper()
+	for _, e := range r.Errors {
+		if strings.Contains(e, want) {
+			return
+		}
+	}
+	t.Fatalf("expected an error containing %q, got %v", want, r.Errors)
+}
+
+// The receiver's target is the trusted anchor: rewriting the dataset name or
+// version inside the package must not let it pass.
+func TestVerifyRejectsRenamedDataset(t *testing.T) {
+	dir, m1, _ := sealTwoVersions(t)
+	pkg, _ := NewStore(dir).Extract(1, []uint64{0, 1})
+	pkg.Manifest.Dataset = "other-dataset"
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 1, Root: m1.Root, Indices: []uint64{0, 1}})
+	if r.Valid {
+		t.Fatal("renamed dataset must fail")
+	}
+	assertErrContains(t, r, "dataset name mismatch")
+}
+
+func TestVerifyRejectsReplacedVersion(t *testing.T) {
+	dir, m1, _ := sealTwoVersions(t)
+	pkg, _ := NewStore(dir).Extract(1, []uint64{0, 1})
+	pkg.Manifest.Version = 7
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 1, Root: m1.Root, Indices: []uint64{0, 1}})
+	if r.Valid {
+		t.Fatal("rewritten version number must fail even when the root is untouched")
+	}
+	assertErrContains(t, r, "version mismatch")
+}
+
+func TestVerifyRejectsDifferentRoot(t *testing.T) {
+	dir, _, m2 := sealTwoVersions(t)
+	// Package genuinely comes from v1, but the receiver trusts v2 of the same
+	// dataset: the self-reported v1 root must not substitute for it.
+	pkg, _ := NewStore(dir).Extract(1, []uint64{0, 1})
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{0, 1}})
+	if r.Valid {
+		t.Fatal("package anchored to another root must fail")
+	}
+	assertErrContains(t, r, "root mismatch")
+}
+
+func TestVerifyRejectsAllEntriesDeleted(t *testing.T) {
+	dir, m1, _ := sealTwoVersions(t)
+	pkg, _ := NewStore(dir).Extract(1, []uint64{0, 1, 2})
+	pkg.Entries = nil
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 1, Root: m1.Root, Indices: []uint64{0, 1, 2}})
+	if r.Valid {
+		t.Fatal("empty package must not verify against a non-empty request")
+	}
+	for _, i := range []uint64{0, 1, 2} {
+		assertErrContains(t, r, fmt.Sprintf("missing expected record at index %d", i))
+	}
+}
+
+func TestVerifyRejectsPartiallyMissingSubset(t *testing.T) {
+	dir, _, m2 := sealTwoVersions(t)
+	// Receiver asked for {0,2}; the package only carries {0}.
+	pkg, _ := NewStore(dir).Extract(2, []uint64{0})
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{0, 2}})
+	if r.Valid {
+		t.Fatal("subset missing a requested record must fail")
+	}
+	assertErrContains(t, r, "missing expected record at index 2")
+}
+
+func TestVerifyRejectsExtraEntry(t *testing.T) {
+	dir, _, m2 := sealTwoVersions(t)
+	pkg, _ := NewStore(dir).Extract(2, []uint64{0, 1})
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{0}})
+	if r.Valid {
+		t.Fatal("unrequested extra record must fail")
+	}
+	assertErrContains(t, r, "extra record not part of the requested set")
+}
+
+func TestVerifyRejectsDuplicatedEntry(t *testing.T) {
+	dir, _, m2 := sealTwoVersions(t)
+	pkg, _ := NewStore(dir).Extract(2, []uint64{0})
+	pkg.Entries = append(pkg.Entries, pkg.Entries[0])
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{0}})
+	if r.Valid {
+		t.Fatal("duplicated entry must fail")
+	}
+	assertErrContains(t, r, "duplicated index 0")
+}
+
+func TestVerifyLegitSubsetPasses(t *testing.T) {
+	dir, _, m2 := sealTwoVersions(t)
+	// Any-order request, de-duplicated: the legitimate subset still passes.
+	pkg, err := NewStore(dir).Extract(2, []uint64{3, 0, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := VerifyPackage(pkg, Expectation{Dataset: "demo", Version: 2, Root: m2.Root, Indices: []uint64{3, 0, 3}})
+	if !r.Valid {
+		t.Fatalf("legit subset must verify: %v", r.Errors)
+	}
+	if r.Matched != 2 {
+		t.Fatalf("matched = %d, want 2", r.Matched)
+	}
+}
+
+func TestVerifyRejectsEmptyExpectation(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	pkg, _ := NewStore(dir).Extract(1, []uint64{0})
+	if r := VerifyPackage(pkg, Expectation{}); r.Valid {
+		t.Fatal("verification without a trusted target must fail")
 	}
 }
