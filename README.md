@@ -32,7 +32,10 @@ go build -o vdex ./cmd/vdex
 ./vdex extract -version 1 -indices 0,3,7 -out part.json
 
 # 4. 接收方独立验证（不需要发布方的 store）
-./vdex verify -package part.json
+#    接收方必须显式给出可信的数据集名、版本和期望的记录集合；
+#    包内自报的清单不能替代这些条件。缺项、多余或重复条目都会失败，
+#    并说明是哪一项要求未满足。可选 -root 进一步钉死可信根。
+./vdex verify -package part.json -dataset users -version 1 -indices 0,3,7
 ```
 
 验证通过退出码为 0；任何篡改或拼接导致失败时退出码为 1。

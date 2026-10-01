@@ -154,14 +154,50 @@ func cmdExtract(args []string) error {
 func cmdVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	path := fs.String("package", "package.json", "package file to verify")
+	dataset := fs.String("dataset", "", "trusted dataset name the package must claim")
+	version := fs.Uint64("version", 0, "trusted version number the package must claim")
+	rootHex := fs.String("root", "", "optional trusted version root (hex) the package must match")
+	indicesFlag := fs.String("indices", "", "comma-separated record indices expected in the package")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *dataset == "" {
+		return errors.New("-dataset is required: the receiver must name the trusted dataset")
+	}
+	if *version == 0 {
+		return errors.New("-version is required: the receiver must name the trusted version")
+	}
+	var req vdex.Request
+	req.Dataset = *dataset
+	req.Version = *version
+	if *rootHex != "" {
+		raw, err := hex.DecodeString(*rootHex)
+		if err != nil || len(raw) != 32 {
+			return fmt.Errorf("bad -root: expected 64 hex chars")
+		}
+		var h vdex.Hash
+		copy(h[:], raw)
+		req.Root = &h
+	}
+	if *indicesFlag == "" {
+		return errors.New("-indices is required: the receiver must state the expected record set")
+	}
+	for _, part := range strings.Split(*indicesFlag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return fmt.Errorf("bad index %q: %w", part, err)
+		}
+		req.Indices = append(req.Indices, i)
 	}
 	pkg, err := vdex.ReadPackage(*path)
 	if err != nil {
 		return err
 	}
-	r := vdex.VerifyPackage(pkg)
+	r := vdex.VerifyPackageAgainst(pkg, req)
 	status := "INVALID"
 	if r.Valid {
 		status = "VALID"

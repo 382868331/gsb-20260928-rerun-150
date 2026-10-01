@@ -82,7 +82,8 @@ func TestExtractAndVerify(t *testing.T) {
 	if len(pkg.Entries) != 2 {
 		t.Fatalf("duplicate requests should de-duplicate, got %d", len(pkg.Entries))
 	}
-	if r := VerifyPackage(pkg); !r.Valid {
+	req := Request{Dataset: "demo", Version: 2, Indices: []uint64{0, 2}}
+	if r := VerifyPackageAgainst(pkg, req); !r.Valid {
 		t.Fatalf("package should verify: %v", r.Errors)
 	}
 }
@@ -94,8 +95,100 @@ func TestVerifyDetectsTampering(t *testing.T) {
 		t.Fatal(err)
 	}
 	pkg.Entries[0].Record = json.RawMessage(`{"id":999}`)
-	if r := VerifyPackage(pkg); r.Valid {
+	req := Request{Dataset: "demo", Version: 1, Indices: []uint64{1}}
+	if r := VerifyPackageAgainst(pkg, req); r.Valid {
 		t.Fatal("tampered record must fail")
+	}
+}
+
+func TestVerifyDetectsDatasetNameMismatch(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	pkg, err := NewStore(dir).Extract(1, []uint64{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{Dataset: "other", Version: 1, Indices: []uint64{0}}
+	r := VerifyPackageAgainst(pkg, req)
+	if r.Valid {
+		t.Fatal("dataset name mismatch must fail")
+	}
+	if !hasErrorContaining(r, "dataset mismatch") {
+		t.Fatalf("failure must name the unmet requirement, got %v", r.Errors)
+	}
+}
+
+func TestVerifyDetectsVersionSubstitution(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	store := NewStore(dir)
+	pkg, err := store.Extract(1, []uint64{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := store.LoadManifest(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Manifest.Version = m2.Version
+	pkg.Manifest.Root = m2.Root
+	pkg.Manifest.LeafCount = m2.LeafCount
+	req := Request{Dataset: "demo", Version: 2, Indices: []uint64{0}}
+	r := VerifyPackageAgainst(pkg, req)
+	if r.Valid {
+		t.Fatal("v1 entries re-labelled as v2 must fail")
+	}
+	if !hasErrorContaining(r, "recomputed root") {
+		t.Fatalf("failure must mention the root mismatch, got %v", r.Errors)
+	}
+}
+
+func TestVerifyDetectsAllEntriesDeleted(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	pkg, err := NewStore(dir).Extract(1, []uint64{0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Entries = nil
+	req := Request{Dataset: "demo", Version: 1, Indices: []uint64{0, 1}}
+	r := VerifyPackageAgainst(pkg, req)
+	if r.Valid {
+		t.Fatal("deleting all entries must fail")
+	}
+	if !hasErrorContaining(r, "missing requested record at index 0") ||
+		!hasErrorContaining(r, "missing requested record at index 1") {
+		t.Fatalf("failure must list every missing record, got %v", r.Errors)
+	}
+}
+
+func TestVerifyDetectsPartiallyMissing(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	pkg, err := NewStore(dir).Extract(2, []uint64{0, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Entries = pkg.Entries[:2]
+	req := Request{Dataset: "demo", Version: 2, Indices: []uint64{0, 2, 3}}
+	r := VerifyPackageAgainst(pkg, req)
+	if r.Valid {
+		t.Fatal("a partially missing record set must fail")
+	}
+	if !hasErrorContaining(r, "missing requested record at index 3") {
+		t.Fatalf("failure must identify the missing index, got %v", r.Errors)
+	}
+}
+
+func TestVerifyDetectsExtraEntry(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	pkg, err := NewStore(dir).Extract(2, []uint64{0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{Dataset: "demo", Version: 2, Indices: []uint64{0}}
+	r := VerifyPackageAgainst(pkg, req)
+	if r.Valid {
+		t.Fatal("unrequested extra entries must fail")
+	}
+	if !hasErrorContaining(r, "unexpected extra record at index 1") {
+		t.Fatalf("failure must identify the extra index, got %v", r.Errors)
 	}
 }
 
@@ -105,9 +198,13 @@ func TestVerifyDetectsCrossVersionSplice(t *testing.T) {
 	pkg1, _ := store.Extract(1, []uint64{0})
 	pkg2, _ := store.Extract(2, []uint64{3})
 	pkg1.Entries = append(pkg1.Entries, pkg2.Entries...)
-	r := VerifyPackage(pkg1)
+	req := Request{Dataset: "demo", Version: 1, Indices: []uint64{0, 3}}
+	r := VerifyPackageAgainst(pkg1, req)
 	if r.Valid {
 		t.Fatal("cross-version splice must fail")
+	}
+	if len(r.Errors) == 0 {
+		t.Fatalf("spliced entry must fail its proof, got %v", r.Errors)
 	}
 }
 
@@ -117,8 +214,23 @@ func TestOldProofInvalidForNewVersion(t *testing.T) {
 	m2, _ := store.LoadManifest(2)
 	pkg1, _ := store.Extract(1, []uint64{0})
 	pkg1.Manifest = m2
-	if r := VerifyPackage(pkg1); r.Valid {
+	req := Request{Dataset: "demo", Version: 2, Indices: []uint64{0}}
+	if r := VerifyPackageAgainst(pkg1, req); r.Valid {
 		t.Fatal("old proofs must not validate under a new version root")
+	}
+}
+
+func TestVerifyDetectsRootPinMismatch(t *testing.T) {
+	dir, m1, _ := sealTwoVersions(t)
+	pkg, err := NewStore(dir).Extract(1, []uint64{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := m1.Root
+	other[0] ^= 0xff
+	req := Request{Dataset: "demo", Version: 1, Root: &other, Indices: []uint64{0}}
+	if r := VerifyPackageAgainst(pkg, req); r.Valid {
+		t.Fatal("package root differing from the trusted root must fail")
 	}
 }
 
@@ -154,7 +266,17 @@ func TestPackageRoundTripFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := ReadPackage(path)
-	if err != nil || !VerifyPackage(got).Valid {
+	req := Request{Dataset: "demo", Version: 2, Indices: []uint64{3}}
+	if err != nil || !VerifyPackageAgainst(got, req).Valid {
 		t.Fatalf("file round trip must verify: %v", err)
 	}
+}
+
+func hasErrorContaining(r VerifyResult, substr string) bool {
+	for _, e := range r.Errors {
+		if strings.Contains(e, substr) {
+			return true
+		}
+	}
+	return false
 }

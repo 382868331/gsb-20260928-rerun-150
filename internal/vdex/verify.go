@@ -5,6 +5,20 @@ import (
 	"sort"
 )
 
+// Request is the receiver-side expectation a package must satisfy.
+// The package's self-declared manifest never substitutes for these
+// conditions: the receiver states which dataset, version and record
+// set they asked for, and verification binds the package to them.
+type Request struct {
+	Dataset string
+	Version uint64
+	// Root, when non-nil, pins the exact trusted version root.
+	Root *Hash
+	// Indices is the exact set of record indices expected in the
+	// package. Missing, extra and duplicated entries are all errors.
+	Indices []uint64
+}
+
 // VerifyResult reports independent verification of a data package.
 type VerifyResult struct {
 	Valid     bool
@@ -16,10 +30,12 @@ type VerifyResult struct {
 	Errors    []string
 }
 
-// VerifyPackage checks a package without any access to the publisher store.
-// It detects tampered records, missing duplicates (same record at distinct
-// indices), position replay, and entries spliced from other versions.
-func VerifyPackage(pkg Package) VerifyResult {
+// VerifyPackageAgainst checks a package against the receiver's explicit
+// request, without any access to the publisher store. It detects tampered
+// records, dataset/version substitution, missing requested records,
+// unexpected extra or duplicated entries, position replay, and entries
+// spliced from other versions.
+func VerifyPackageAgainst(pkg Package, req Request) VerifyResult {
 	r := VerifyResult{
 		Dataset:   pkg.Manifest.Dataset,
 		Version:   pkg.Manifest.Version,
@@ -37,6 +53,24 @@ func VerifyPackage(pkg Package) VerifyResult {
 		addErr("invalid manifest: %v", err)
 	}
 
+	if pkg.Manifest.Dataset != req.Dataset {
+		addErr("dataset mismatch: requested %q but package claims %q", req.Dataset, pkg.Manifest.Dataset)
+	}
+	if pkg.Manifest.Version != req.Version {
+		addErr("version mismatch: requested v%d but package claims v%d", req.Version, pkg.Manifest.Version)
+	}
+	if req.Root != nil && pkg.Manifest.Root != *req.Root {
+		addErr("root mismatch: package root does not match the trusted root")
+	}
+
+	want := map[uint64]bool{}
+	for _, i := range req.Indices {
+		if want[i] {
+			addErr("request lists index %d more than once", i)
+		}
+		want[i] = true
+	}
+
 	seen := map[uint64]bool{}
 	if !sort.SliceIsSorted(pkg.Entries, func(a, b int) bool {
 		return pkg.Entries[a].Index < pkg.Entries[b].Index
@@ -51,6 +85,9 @@ func VerifyPackage(pkg Package) VerifyResult {
 			addErr("entry %d: duplicated index %d in package", i, e.Index)
 		}
 		seen[e.Index] = true
+		if !want[e.Index] {
+			addErr("entry %d: unexpected extra record at index %d (not requested)", i, e.Index)
+		}
 		normalized, err := compactJSON(e.Record)
 		if err != nil {
 			addErr("entry %d: invalid record JSON: %v", e.Index, err)
@@ -58,6 +95,11 @@ func VerifyPackage(pkg Package) VerifyResult {
 		}
 		if err := e.Proof.Verify(pkg.Manifest.Root, pkg.Manifest.LeafCount, normalized); err != nil {
 			addErr("entry %d: %v", e.Index, err)
+		}
+	}
+	for i := range want {
+		if !seen[i] {
+			addErr("missing requested record at index %d", i)
 		}
 	}
 	r.Valid = len(r.Errors) == 0
