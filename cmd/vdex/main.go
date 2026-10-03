@@ -153,13 +153,17 @@ func cmdExtract(args []string) error {
 
 func cmdVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
-	path := fs.String("package", "package.json", "package file to verify")
+	var paths stringList
+	fs.Var(&paths, "package", "package file to verify (repeatable: batches of one request may arrive separately)")
 	dataset := fs.String("dataset", "", "trusted dataset name the package must claim")
 	version := fs.Uint64("version", 0, "trusted version number the package must claim")
-	rootHex := fs.String("root", "", "optional trusted version root (hex) the package must match")
+	rootHex := fs.String("root", "", "trusted version root (hex) from a source the receiver already trusts")
 	indicesFlag := fs.String("indices", "", "comma-separated record indices expected in the package")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if len(paths) == 0 {
+		return errors.New("-package is required")
 	}
 	if *dataset == "" {
 		return errors.New("-dataset is required: the receiver must name the trusted dataset")
@@ -167,18 +171,19 @@ func cmdVerify(args []string) error {
 	if *version == 0 {
 		return errors.New("-version is required: the receiver must name the trusted version")
 	}
+	if *rootHex == "" {
+		return errors.New("-root is required: without a trusted root the package only proves its own self-consistency")
+	}
 	var req vdex.Request
 	req.Dataset = *dataset
 	req.Version = *version
-	if *rootHex != "" {
-		raw, err := hex.DecodeString(*rootHex)
-		if err != nil || len(raw) != 32 {
-			return fmt.Errorf("bad -root: expected 64 hex chars")
-		}
-		var h vdex.Hash
-		copy(h[:], raw)
-		req.Root = &h
+	raw, err := hex.DecodeString(*rootHex)
+	if err != nil || len(raw) != 32 {
+		return fmt.Errorf("bad -root: expected 64 hex chars")
 	}
+	var h vdex.Hash
+	copy(h[:], raw)
+	req.Root = &h
 	if *indicesFlag == "" {
 		return errors.New("-indices is required: the receiver must state the expected record set")
 	}
@@ -193,23 +198,49 @@ func cmdVerify(args []string) error {
 		}
 		req.Indices = append(req.Indices, i)
 	}
-	pkg, err := vdex.ReadPackage(*path)
+	session, err := vdex.NewSession(req)
 	if err != nil {
 		return err
 	}
-	r := vdex.VerifyPackageAgainst(pkg, req)
-	status := "INVALID"
-	if r.Valid {
-		status = "VALID"
+	for _, p := range paths {
+		pkg, err := vdex.ReadPackage(p)
+		if err != nil {
+			return err
+		}
+		session.Add(pkg)
 	}
-	fmt.Printf("%s  dataset=%s version=%d root=%s entries=%d/%d\n",
-		status, r.Dataset, r.Version, hex.EncodeToString(r.Root[:]), r.Entries, r.LeafCount)
-	for _, e := range r.Errors {
+	st := session.Status()
+	status := "INCOMPLETE"
+	switch {
+	case st.Complete:
+		status = "VALID"
+	case len(st.Conflicts) > 0 || len(st.Rejected) > 0:
+		status = "INVALID"
+	}
+	fmt.Printf("%s  dataset=%s version=%d root=%s verified=%d missing=%d duplicates=%d\n",
+		status, req.Dataset, req.Version, hex.EncodeToString(h[:]),
+		len(st.Verified), len(st.Missing), st.Duplicates)
+	for _, i := range st.Missing {
+		fmt.Fprintln(os.Stderr, "  - missing required record at index", i)
+	}
+	for _, c := range st.Conflicts {
+		fmt.Fprintf(os.Stderr, "  - conflicting material at index %d: accepted %s, later arrival %s\n",
+			c.Index, c.Accepted, c.Rejected)
+	}
+	for _, e := range st.Rejected {
 		fmt.Fprintln(os.Stderr, "  -", e)
 	}
-	if !r.Valid {
+	if !st.Complete {
 		return errVerification
 	}
+	return nil
+}
+
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package vdex
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -12,11 +13,64 @@ import (
 type Request struct {
 	Dataset string
 	Version uint64
-	// Root, when non-nil, pins the exact trusted version root.
+	// Root is the trusted version root, obtained from a source the
+	// receiver already trusts. It is required: without it the package
+	// only proves its own self-consistency, and verification must fail
+	// rather than silently accept a root supplied by the material
+	// under examination.
 	Root *Hash
 	// Indices is the exact set of record indices expected in the
 	// package. Missing, extra and duplicated entries are all errors.
 	Indices []uint64
+}
+
+// Fingerprint is the canonical identity of a request. Any change to the
+// dataset, version, trusted root or required record set yields a new
+// fingerprint, and therefore a new verification decision: a pass
+// obtained under one fingerprint never carries over to another.
+func (r Request) Fingerprint() Hash {
+	uniq := map[uint64]bool{}
+	var indices []uint64
+	for _, i := range r.Indices {
+		if !uniq[i] {
+			uniq[i] = true
+			indices = append(indices, i)
+		}
+	}
+	sort.Slice(indices, func(a, b int) bool { return indices[a] < indices[b] })
+	parts := [][]byte{[]byte(r.Dataset), u64Bytes(r.Version)}
+	if r.Root != nil {
+		parts = append(parts, r.Root[:])
+	} else {
+		parts = append(parts, []byte("no-trusted-root"))
+	}
+	for _, i := range indices {
+		parts = append(parts, u64Bytes(i))
+	}
+	return hashDomain("vdex-request-v1", parts...)
+}
+
+// validateRequest enforces the trust boundary before any material is
+// examined: the receiver must supply the trusted basis (dataset,
+// version, root) and an unambiguous required record set.
+func validateRequest(req Request) error {
+	if req.Dataset == "" {
+		return errors.New("request must name the trusted dataset")
+	}
+	if req.Version == 0 {
+		return errors.New("request must name the trusted version")
+	}
+	if req.Root == nil {
+		return errors.New("no trusted root: the package's self-declared manifest cannot vouch for itself")
+	}
+	seen := map[uint64]bool{}
+	for _, i := range req.Indices {
+		if seen[i] {
+			return fmt.Errorf("request lists index %d more than once", i)
+		}
+		seen[i] = true
+	}
+	return nil
 }
 
 // VerifyResult reports independent verification of a data package.
@@ -59,7 +113,9 @@ func VerifyPackageAgainst(pkg Package, req Request) VerifyResult {
 	if pkg.Manifest.Version != req.Version {
 		addErr("version mismatch: requested v%d but package claims v%d", req.Version, pkg.Manifest.Version)
 	}
-	if req.Root != nil && pkg.Manifest.Root != *req.Root {
+	if req.Root == nil {
+		addErr("no trusted root provided: the package only proves its own self-consistency")
+	} else if pkg.Manifest.Root != *req.Root {
 		addErr("root mismatch: package root does not match the trusted root")
 	}
 
