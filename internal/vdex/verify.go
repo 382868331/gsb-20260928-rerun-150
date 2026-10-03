@@ -1,6 +1,7 @@
 package vdex
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -9,14 +10,76 @@ import (
 // The package's self-declared manifest never substitutes for these
 // conditions: the receiver states which dataset, version and record
 // set they asked for, and verification binds the package to them.
+//
+// Root is the trust boundary and is mandatory: without an external
+// trusted root the material only proves self-consistency, so
+// verification must fail rather than derive trust from the package
+// itself.
 type Request struct {
-	Dataset string
-	Version uint64
-	// Root, when non-nil, pins the exact trusted version root.
-	Root *Hash
+	Dataset string `json:"dataset"`
+	Version uint64 `json:"version"`
+	// Root pins the exact trusted version root. It must come from a
+	// source outside the package under verification.
+	Root *Hash `json:"root,omitempty"`
 	// Indices is the exact set of record indices expected in the
 	// package. Missing, extra and duplicated entries are all errors.
-	Indices []uint64
+	Indices []uint64 `json:"indices"`
+}
+
+// canonical returns the request with its record set normalized
+// (sorted, de-duplicated), so that requests stating the same set in
+// different orders are the same requirement.
+func (r Request) canonical() Request {
+	set := map[uint64]bool{}
+	var idx []uint64
+	for _, i := range r.Indices {
+		if !set[i] {
+			set[i] = true
+			idx = append(idx, i)
+		}
+	}
+	sort.Slice(idx, func(a, b int) bool { return idx[a] < idx[b] })
+	return Request{Dataset: r.Dataset, Version: r.Version, Root: r.Root, Indices: idx}
+}
+
+// validate checks the request itself is well-formed and carries the
+// trusted basis verification depends on.
+func (r Request) validate() error {
+	if r.Dataset == "" {
+		return errors.New("request must name the trusted dataset")
+	}
+	if r.Version == 0 {
+		return errors.New("request must name the trusted version")
+	}
+	if r.Root == nil {
+		return errors.New("trusted root is required: the package's self-declared root cannot vouch for itself")
+	}
+	if len(r.Indices) == 0 {
+		return errors.New("request must state the expected record set")
+	}
+	return nil
+}
+
+// sameRequirement reports whether two requests fix the same record set,
+// scope and trusted basis. A request modified in any of these is a new
+// decision and must not inherit earlier conclusions.
+func sameRequirement(a, b Request) bool {
+	ca, cb := a.canonical(), b.canonical()
+	if ca.Dataset != cb.Dataset || ca.Version != cb.Version || len(ca.Indices) != len(cb.Indices) {
+		return false
+	}
+	if (ca.Root == nil) != (cb.Root == nil) {
+		return false
+	}
+	if ca.Root != nil && *ca.Root != *cb.Root {
+		return false
+	}
+	for i := range ca.Indices {
+		if ca.Indices[i] != cb.Indices[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // VerifyResult reports independent verification of a data package.
@@ -59,7 +122,9 @@ func VerifyPackageAgainst(pkg Package, req Request) VerifyResult {
 	if pkg.Manifest.Version != req.Version {
 		addErr("version mismatch: requested v%d but package claims v%d", req.Version, pkg.Manifest.Version)
 	}
-	if req.Root != nil && pkg.Manifest.Root != *req.Root {
+	if req.Root == nil {
+		addErr("trusted root is required: the package's self-declared root cannot vouch for itself")
+	} else if pkg.Manifest.Root != *req.Root {
 		addErr("root mismatch: package root does not match the trusted root")
 	}
 
