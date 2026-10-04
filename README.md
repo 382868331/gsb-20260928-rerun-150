@@ -41,11 +41,17 @@ go build -o vdex ./cmd/vdex
 
 # 5. 同一请求的材料可分批到达：重复 -package 按到达顺序合并，
 #    乱序与重复补交不改变要求；只有所需集合全部核对通过才输出 VALID，
-#    部分到达输出 INCOMPLETE，矛盾或被拒材料输出 INVALID 并保留证据。
+#    部分到达输出 INCOMPLETE，矛盾或被拒材料输出 INVALID 并保留证据
+#    （原文、到达批次、拒绝依据）。-decisions 指定决定归档目录：
+#    已核对部分落盘后可重开接续；修改请求会形成新决定，旧决定的
+#    材料与结论仍可用 vdex decisions 查询，不会沿用旧的通过状态。
 ./vdex verify -package part1.json -package part2.json -dataset users -version 1 -root <可信根hex> -indices 0,3,7
+
+# 6. 查看归档的全部验证决定（含被新请求取代的旧决定）
+./vdex decisions -dir vdex-decisions
 ```
 
-验证完整通过（VALID）退出码为 0；INCOMPLETE / INVALID 退出码为 1。
+输出行把所需集合明确划分为 `verified` / `missing` / `conflicted`：同一索引先到的可信记录与后到的不同内容会同时保留（含双方原文、到达批次和拒绝依据），重复补交的相同争议内容只计数、不重复堆积证据；只要存在缺失、矛盾或被拒材料，整体状态就不会显示 VALID。验证完整通过（VALID）退出码为 0；INCOMPLETE / INVALID 退出码为 1。
 
 ## 产物布局
 
@@ -58,6 +64,7 @@ vdex-store/
     v000000000002/
       ...
 part.json             # 清单 + 选中记录 + 每条的 Merkle 包含证明
+vdex-decisions/        # 接收方决定归档，每个请求指纹一个只追加文件
 ```
 
 数据包是传输无关的单个 JSON 文件：以后增加任何传输通道，都只是搬运这个文件，证明语义不变。

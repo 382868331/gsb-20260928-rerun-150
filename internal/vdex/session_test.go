@@ -115,25 +115,51 @@ func TestSessionConflictKeepsBothSides(t *testing.T) {
 	forged.Entries[0].Record = json.RawMessage(`{"id":999}`)
 	s.Add(forged)
 	st := s.Status()
-	if len(st.Rejected) == 0 {
+	if len(st.Refused) == 0 {
 		t.Fatal("forged replacement must be kept as refused evidence")
+	}
+	ev := st.Refused[0]
+	if string(ev.Record) != `{"id":999}` || ev.Batch != 2 {
+		t.Fatalf("refused evidence must keep the original bytes and arrival batch: %+v", ev)
+	}
+	if !strings.Contains(ev.Basis, "leaf verification failed") {
+		t.Fatalf("refusal basis must explain the failed leaf check, got %q", ev.Basis)
 	}
 	// Under one trusted root a second valid proof for the same index
 	// with different content cannot be produced, so the conflict branch
 	// is exercised directly: the session must preserve both sides.
 	s3, _ := NewSession(sessionRequest(t, dir, 2, 0))
-	s3.verified[0] = json.RawMessage(`{"id":777}`)
+	s3.verified[0] = Evidence{Record: json.RawMessage(`{"id":777}`), Batch: 1, Basis: "verified against trusted root"}
+	s3.batches = 1
 	s3.Add(pkg)
 	st3 := s3.Status()
 	if len(st3.Conflicts) != 1 {
 		t.Fatalf("conflicting content must be recorded: %+v", st3)
 	}
 	c := st3.Conflicts[0]
-	if string(c.Accepted) != `{"id":777}` || string(c.Rejected) != `{"id":1}` {
+	if string(c.Accepted.Record) != `{"id":777}` || len(c.Disputed) != 1 || string(c.Disputed[0].Record) != `{"id":1}` {
 		t.Fatalf("both sides of the conflict must be preserved: %+v", c)
+	}
+	if c.Disputed[0].Batch != 2 || !strings.Contains(c.Disputed[0].Basis, "contradict") {
+		t.Fatalf("disputed side must carry batch and basis: %+v", c.Disputed[0])
+	}
+	if len(st3.Conflicted) != 1 || st3.Conflicted[0] != 0 {
+		t.Fatalf("conflicted index must be partitioned out of verified/missing: %+v", st3)
+	}
+	if len(st3.Verified) != 0 || len(st3.Missing) != 0 {
+		t.Fatalf("a conflicted index is neither verified nor missing: %+v", st3)
 	}
 	if st3.Complete {
 		t.Fatal("an unresolved conflict must block completion")
+	}
+
+	// Repeated deliveries of the same disputed content must not pile up
+	// identical evidence forever.
+	s3.Add(pkg)
+	s3.Add(pkg)
+	st3 = s3.Status()
+	if len(st3.Conflicts[0].Disputed) != 1 || st3.Conflicts[0].Repeats != 2 {
+		t.Fatalf("duplicate disputed material must be counted, not stored again: %+v", st3.Conflicts[0])
 	}
 }
 
@@ -153,8 +179,11 @@ func TestSessionRejectsBatchFromWrongVersion(t *testing.T) {
 	if st.Complete || len(st.Verified) != 0 {
 		t.Fatalf("material outside the pinned scope must not count: %+v", st)
 	}
-	if len(st.Rejected) == 0 || !strings.Contains(st.Rejected[0], "request pinned") {
-		t.Fatalf("refusal must name the pinned scope: %v", st.Rejected)
+	if len(st.Refused) == 0 || !strings.Contains(st.Refused[0].Basis, "request pinned") {
+		t.Fatalf("refusal must name the pinned scope: %v", st.Refused)
+	}
+	if st.Refused[0].Batch != 1 {
+		t.Fatalf("whole-batch refusal must record its arrival batch: %+v", st.Refused[0])
 	}
 }
 

@@ -34,10 +34,11 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: vdex <command> [flags]
 
 commands:
-  seal     seal a JSONL dataset into a new immutable version
-  versions list sealed versions
-  extract  export a subset of records with inclusion proofs
-  verify   independently verify an exported package`)
+  seal      seal a JSONL dataset into a new immutable version
+  versions  list sealed versions
+  extract   export a subset of records with inclusion proofs
+  verify    independently verify an exported package
+  decisions list archived verification decisions`)
 }
 
 func run(cmd string, args []string) error {
@@ -50,6 +51,8 @@ func run(cmd string, args []string) error {
 		return cmdExtract(args)
 	case "verify":
 		return cmdVerify(args)
+	case "decisions":
+		return cmdDecisions(args)
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -159,6 +162,7 @@ func cmdVerify(args []string) error {
 	version := fs.Uint64("version", 0, "trusted version number the package must claim")
 	rootHex := fs.String("root", "", "trusted version root (hex) from a source the receiver already trusts")
 	indicesFlag := fs.String("indices", "", "comma-separated record indices expected in the package")
+	decisionsDir := fs.String("decisions", "", "decision archive directory: resume prior batches and save this decision")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -198,9 +202,22 @@ func cmdVerify(args []string) error {
 		}
 		req.Indices = append(req.Indices, i)
 	}
-	session, err := vdex.NewSession(req)
-	if err != nil {
-		return err
+	var session *vdex.Session
+	if *decisionsDir != "" {
+		var resumed bool
+		session, resumed, err = vdex.NewDecisionStore(*decisionsDir).Open(req)
+		if err != nil {
+			return err
+		}
+		if resumed {
+			fp := session.Fingerprint()
+			fmt.Fprintf(os.Stderr, "resuming archived decision %x\n", fp[:12])
+		}
+	} else {
+		session, err = vdex.NewSession(req)
+		if err != nil {
+			return err
+		}
 	}
 	for _, p := range paths {
 		pkg, err := vdex.ReadPackage(p)
@@ -210,28 +227,75 @@ func cmdVerify(args []string) error {
 		session.Add(pkg)
 	}
 	st := session.Status()
+	if *decisionsDir != "" {
+		if _, err := vdex.NewDecisionStore(*decisionsDir).Save(session); err != nil {
+			return err
+		}
+	}
 	status := "INCOMPLETE"
 	switch {
 	case st.Complete:
 		status = "VALID"
-	case len(st.Conflicts) > 0 || len(st.Rejected) > 0:
+	case len(st.Conflicts) > 0 || len(st.Refused) > 0:
 		status = "INVALID"
 	}
-	fmt.Printf("%s  dataset=%s version=%d root=%s verified=%d missing=%d duplicates=%d\n",
+	fmt.Printf("%s  dataset=%s version=%d root=%s verified=%d missing=%d conflicted=%d duplicates=%d\n",
 		status, req.Dataset, req.Version, hex.EncodeToString(h[:]),
-		len(st.Verified), len(st.Missing), st.Duplicates)
+		len(st.Verified), len(st.Missing), len(st.Conflicted), st.Duplicates)
 	for _, i := range st.Missing {
 		fmt.Fprintln(os.Stderr, "  - missing required record at index", i)
 	}
 	for _, c := range st.Conflicts {
-		fmt.Fprintf(os.Stderr, "  - conflicting material at index %d: accepted %s, later arrival %s\n",
-			c.Index, c.Accepted, c.Rejected)
+		fmt.Fprintf(os.Stderr, "  - conflict at index %d: accepted batch %d %s (%s)\n",
+			c.Index, c.Accepted.Batch, c.Accepted.Record, c.Accepted.Basis)
+		for _, ev := range c.Disputed {
+			fmt.Fprintf(os.Stderr, "      disputed batch %d: %s (%s)\n", ev.Batch, ev.Record, ev.Basis)
+		}
+		if c.Repeats > 0 {
+			fmt.Fprintf(os.Stderr, "      %d repeat delivery(ies) of identical disputed content\n", c.Repeats)
+		}
 	}
-	for _, e := range st.Rejected {
-		fmt.Fprintln(os.Stderr, "  -", e)
+	for _, e := range st.Refused {
+		switch {
+		case e.Index != nil && len(e.Record) > 0:
+			fmt.Fprintf(os.Stderr, "  - batch %d index %d original=%s: %s\n", e.Batch, *e.Index, e.Record, e.Basis)
+		case e.Index != nil:
+			fmt.Fprintf(os.Stderr, "  - batch %d index %d: %s\n", e.Batch, *e.Index, e.Basis)
+		default:
+			fmt.Fprintf(os.Stderr, "  - batch %d: %s\n", e.Batch, e.Basis)
+		}
 	}
 	if !st.Complete {
 		return errVerification
+	}
+	return nil
+}
+
+func cmdDecisions(args []string) error {
+	fs := flag.NewFlagSet("decisions", flag.ContinueOnError)
+	storeDir := fs.String("dir", "./vdex-decisions", "decision archive directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	decs, err := vdex.NewDecisionStore(*storeDir).List()
+	if err != nil {
+		return err
+	}
+	if len(decs) == 0 {
+		fmt.Println("no archived decisions")
+		return nil
+	}
+	for _, dec := range decs {
+		st := "INCOMPLETE"
+		switch {
+		case dec.Complete:
+			st = "VALID"
+		case len(dec.Snapshot.Conflicts) > 0 || len(dec.Snapshot.Refused) > 0:
+			st = "INVALID"
+		}
+		fmt.Printf("%s  id=%s dataset=%s version=%d indices=%v batches=%d\n",
+			st, hex.EncodeToString(dec.Fingerprint[:12]),
+			dec.Request.Dataset, dec.Request.Version, dec.Request.Indices, dec.Snapshot.Batches)
 	}
 	return nil
 }
