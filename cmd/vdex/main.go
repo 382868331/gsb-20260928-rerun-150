@@ -224,11 +224,16 @@ func cmdVerify(args []string) error {
 		fmt.Fprintln(os.Stderr, "  - missing required record at index", i)
 	}
 	for _, c := range st.Conflicts {
-		fmt.Fprintf(os.Stderr, "  - conflicting material at index %d: accepted %s, later arrival %s\n",
-			c.Index, c.Accepted, c.Rejected)
+		fmt.Fprintf(os.Stderr, "  - conflicting material at index %d (x%d): accepted %s (batch %d), later arrival %s (batch %d): %s\n",
+			c.Index, c.Count, c.Accepted, c.AcceptedBatch, c.Rejected, c.RejectedBatch, c.Reason)
 	}
 	for _, e := range st.Rejected {
-		fmt.Fprintln(os.Stderr, "  -", e)
+		if e.Index != nil {
+			fmt.Fprintf(os.Stderr, "  - batch %d index %d (x%d): %s; kept record: %s\n",
+				e.Batch, *e.Index, e.Count, e.Reason, e.Record)
+		} else {
+			fmt.Fprintf(os.Stderr, "  - batch %d (x%d): %s\n", e.Batch, e.Count, e.Reason)
+		}
 	}
 	if !st.Complete {
 		return errVerification
