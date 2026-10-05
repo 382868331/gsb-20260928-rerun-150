@@ -252,7 +252,7 @@ func cmdVerify(args []string) error {
 			fmt.Fprintf(os.Stderr, "      disputed batch %d: %s (%s)\n", ev.Batch, ev.Record, ev.Basis)
 		}
 		if c.Repeats > 0 {
-			fmt.Fprintf(os.Stderr, "      %d repeat delivery(ies) of identical disputed content\n", c.Repeats)
+			fmt.Fprintf(os.Stderr, "      %d repeat delivery(ies) of identical disputed content at batches %v\n", c.Repeats, c.RepeatBatches)
 		}
 	}
 	for _, e := range st.Refused {
@@ -263,6 +263,9 @@ func cmdVerify(args []string) error {
 			fmt.Fprintf(os.Stderr, "  - batch %d index %d: %s\n", e.Batch, *e.Index, e.Basis)
 		default:
 			fmt.Fprintf(os.Stderr, "  - batch %d: %s\n", e.Batch, e.Basis)
+		}
+		if e.Repeats > 0 {
+			fmt.Fprintf(os.Stderr, "      %d repeat delivery(ies) of identical refused material at batches %v\n", e.Repeats, e.RepeatBatches)
 		}
 	}
 	if !st.Complete {

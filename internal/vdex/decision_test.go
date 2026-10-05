@@ -48,16 +48,18 @@ func TestSessionReopenThenContradictionAcrossBatches(t *testing.T) {
 	if st.Complete {
 		t.Fatal("later contradiction must revoke the full-pass appearance")
 	}
-	if len(st.Refused) != 2 {
-		t.Fatalf("both invalid arrivals must be retained with their batches: %+v", st.Refused)
+	if len(st.Refused) != 1 {
+		t.Fatalf("identical refused arrivals must collapse to one piece of evidence: %+v", st.Refused)
 	}
-	for i, ev := range st.Refused {
-		if string(ev.Record) != `{"id":42}` || ev.Batch != uint64(i+3) {
-			t.Fatalf("disputed original and arrival batch must survive: %+v", ev)
-		}
-		if !strings.Contains(ev.Basis, "leaf verification failed") {
-			t.Fatalf("refusal basis must name the failed leaf check: %q", ev.Basis)
-		}
+	ev := st.Refused[0]
+	if string(ev.Record) != `{"id":42}` || ev.Batch != 3 {
+		t.Fatalf("first arrival batch and original bytes must survive: %+v", ev)
+	}
+	if !strings.Contains(ev.Basis, "leaf verification failed") {
+		t.Fatalf("refusal basis must name the failed leaf check: %q", ev.Basis)
+	}
+	if ev.Repeats != 1 || len(ev.RepeatBatches) != 1 || ev.RepeatBatches[0] != 4 {
+		t.Fatalf("repeat arrival must be counted with its batch, not stored again: %+v", ev)
 	}
 	if len(st.Verified) != 3 {
 		t.Fatalf("the verified record set stays intact and auditable: %+v", st.Verified)
@@ -69,7 +71,7 @@ func TestSessionReopenThenContradictionAcrossBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	st3 := s3.Status()
-	if st3.Complete || len(st3.Refused) != 2 {
+	if st3.Complete || len(st3.Refused) != 1 || st3.Refused[0].Repeats != 1 {
 		t.Fatalf("conflict evidence must survive persistence: %+v", st3)
 	}
 }
@@ -96,16 +98,28 @@ func TestInvalidLaterMaterialIsRetainedNotLost(t *testing.T) {
 	if st.Complete {
 		t.Fatal("invalid later material must block the pass")
 	}
-	if len(st.Refused) != 2 {
-		t.Fatalf("each refused arrival remains auditable with its batch: %+v", st.Refused)
+	if len(st.Refused) != 1 {
+		t.Fatalf("identical refused arrivals must be stored once: %+v", st.Refused)
 	}
-	for i, ev := range st.Refused {
-		if string(ev.Record) != `{"id":999}` || ev.Batch != uint64(i+2) {
-			t.Fatalf("original and batch must be retained: %+v", ev)
-		}
-		if !strings.Contains(ev.Basis, "leaf verification failed") {
-			t.Fatalf("basis must name the leaf failure: %q", ev.Basis)
-		}
+	ev := st.Refused[0]
+	if string(ev.Record) != `{"id":999}` || ev.Batch != 2 {
+		t.Fatalf("first refused original and batch must be retained: %+v", ev)
+	}
+	if !strings.Contains(ev.Basis, "leaf verification failed") {
+		t.Fatalf("basis must name the leaf failure: %q", ev.Basis)
+	}
+	if ev.Repeats != 1 || len(ev.RepeatBatches) != 1 || ev.RepeatBatches[0] != 3 {
+		t.Fatalf("repeat delivery must be counted and its batch recorded: %+v", ev)
+	}
+
+	// Distinct invalid content for the same index stays independently retained.
+	other := good
+	other.Entries = append([]Entry(nil), good.Entries...)
+	other.Entries[0].Record = json.RawMessage(`{"id":1000}`)
+	s.Add(other)
+	st = s.Status()
+	if len(st.Refused) != 2 {
+		t.Fatalf("different refused content must be stored independently: %+v", st.Refused)
 	}
 }
 

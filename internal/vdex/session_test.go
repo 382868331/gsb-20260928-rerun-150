@@ -161,6 +161,21 @@ func TestSessionConflictKeepsBothSides(t *testing.T) {
 	if len(st3.Conflicts[0].Disputed) != 1 || st3.Conflicts[0].Repeats != 2 {
 		t.Fatalf("duplicate disputed material must be counted, not stored again: %+v", st3.Conflicts[0])
 	}
+	if len(st3.Conflicts[0].RepeatBatches) != 2 || st3.Conflicts[0].RepeatBatches[0] != 3 || st3.Conflicts[0].RepeatBatches[1] != 4 {
+		t.Fatalf("disputed repeat batches must be recorded: %+v", st3.Conflicts[0])
+	}
+
+	// The dedup boundary survives a save/resume cycle even though the
+	// snapshot re-formats the JSON bytes.
+	s4, err := Resume(s3.req, s3.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s4.Add(pkg)
+	st4 := s4.Status()
+	if len(st4.Conflicts[0].Disputed) != 1 || st4.Conflicts[0].Repeats != 3 || len(st4.Conflicts[0].RepeatBatches) != 3 {
+		t.Fatalf("disputed dedup must survive persistence: %+v", st4.Conflicts[0])
+	}
 }
 
 func TestSessionRejectsBatchFromWrongVersion(t *testing.T) {
@@ -184,6 +199,75 @@ func TestSessionRejectsBatchFromWrongVersion(t *testing.T) {
 	}
 	if st.Refused[0].Batch != 1 {
 		t.Fatalf("whole-batch refusal must record its arrival batch: %+v", st.Refused[0])
+	}
+}
+
+// Identical refused material (same index, same original bytes, same
+// basis) is stored once no matter how often it arrives, including after
+// a save/resume cycle; distinct content stays independent and the
+// decision can never return to a full pass while any refusal exists.
+func TestSessionRefusedEvidenceDedupAcrossResume(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	store := NewStore(dir)
+	req := sessionRequest(t, dir, 2, 0)
+	s, _ := NewSession(req)
+	good, _ := store.Extract(2, []uint64{0})
+	s.Add(good)
+
+	bad := good
+	bad.Entries = append([]Entry(nil), good.Entries...)
+	bad.Entries[0].Record = json.RawMessage(`{"id":999}`)
+	s.Add(bad)
+
+	// Save the partial (already disputed) state and reopen it.
+	s2, err := Resume(req, s.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.Add(bad)
+	s2.Add(bad)
+	st := s2.Status()
+	if st.Complete {
+		t.Fatal("refused material must keep blocking the pass")
+	}
+	if len(st.Refused) != 1 {
+		t.Fatalf("repeated identical refusals must collapse to one: %+v", st.Refused)
+	}
+	ev := st.Refused[0]
+	if ev.Batch != 2 || string(ev.Record) != `{"id":999}` {
+		t.Fatalf("first batch and trusted original must be preserved: %+v", ev)
+	}
+	if ev.Repeats != 2 || len(ev.RepeatBatches) != 2 || ev.RepeatBatches[0] != 3 || ev.RepeatBatches[1] != 4 {
+		t.Fatalf("repeat counts and arrival batches must be exact: %+v", ev)
+	}
+
+	// Repeated wrong-version batches dedup on the batch-level basis too.
+	wrong, _ := store.Extract(1, []uint64{0})
+	s2.Add(wrong)
+	s2.Add(wrong)
+	st = s2.Status()
+	batchRefusals := 0
+	for _, r := range st.Refused {
+		if r.Index == nil {
+			batchRefusals++
+			if r.Repeats != 1 {
+				t.Fatalf("identical batch refusals must be counted: %+v", r)
+			}
+		}
+	}
+	if batchRefusals != 1 {
+		t.Fatalf("identical whole-batch refusals must collapse to one: %+v", st.Refused)
+	}
+
+	// After another resume the dedup boundary is unchanged.
+	s3, err := Resume(req, s2.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3.Add(bad)
+	st3 := s3.Status()
+	if st3.Complete || len(st3.Refused) != 2 || st3.Refused[0].Repeats != 3 {
+		t.Fatalf("dedup must survive persistence and keep blocking VALID: %+v", st3)
 	}
 }
 
