@@ -38,12 +38,14 @@ type Conflict struct {
 // contradicts the pinned request) or at entry level (wrong position,
 // malformed record, failed leaf proof, unrequested index). Index is nil
 // for whole-batch refusals. The original record is retained whenever an
-// entry-level payload exists.
+// entry-level payload exists. Batch is the first matching arrival; later
+// arrivals with the same index, record and basis increment Repeats.
 type RefusedEvidence struct {
-	Index  *uint64         `json:"index,omitempty"`
-	Record json.RawMessage `json:"record,omitempty"`
-	Batch  uint64          `json:"batch"`
-	Basis  string          `json:"basis"`
+	Index   *uint64         `json:"index,omitempty"`
+	Record  json.RawMessage `json:"record,omitempty"`
+	Batch   uint64          `json:"batch"`
+	Basis   string          `json:"basis"`
+	Repeats int             `json:"repeats,omitempty"`
 }
 
 // Session accumulates material for one fixed verification request.
@@ -93,7 +95,7 @@ func (s *Session) Add(pkg Package) {
 	s.batches++
 	batch := s.batches
 	refuseBatch := func(basis string) {
-		s.refused = append(s.refused, RefusedEvidence{Batch: batch, Basis: basis})
+		s.addRefused(nil, nil, batch, basis)
 	}
 	if pkg.Format != PackageFormat {
 		refuseBatch(fmt.Sprintf("batch refused: unsupported package format %q", pkg.Format))
@@ -117,12 +119,7 @@ func (s *Session) Add(pkg Package) {
 	for _, e := range pkg.Entries {
 		idx := e.Index
 		refuseEntry := func(record json.RawMessage, basis string) {
-			s.refused = append(s.refused, RefusedEvidence{
-				Index:  &idx,
-				Record: append(json.RawMessage(nil), record...),
-				Batch:  batch,
-				Basis:  basis,
-			})
+			s.addRefused(&idx, record, batch, basis)
 		}
 		if e.Index != e.Proof.Index {
 			refuseEntry(e.Record, fmt.Sprintf(
@@ -146,7 +143,7 @@ func (s *Session) Add(pkg Package) {
 			continue
 		}
 		if err := e.Proof.Verify(*s.req.Root, pkg.Manifest.LeafCount, normalized); err != nil {
-			refuseEntry(normalized, fmt.Sprintf("entry refused: leaf verification failed: %v", err))
+			refuseEntry(e.Record, fmt.Sprintf("entry refused: leaf verification failed: %v", err))
 			continue
 		}
 		ev := Evidence{Record: normalized, Batch: batch, Basis: "verified against trusted root"}
@@ -163,9 +160,43 @@ func (s *Session) Add(pkg Package) {
 	}
 }
 
+// addRefused keeps the first arrival of each distinct index, original
+// record and refusal basis. Later identical arrivals only increment
+// Repeats, so repeated invalid material cannot grow without bound.
+func (s *Session) addRefused(index *uint64, record json.RawMessage, batch uint64, basis string) {
+	for i := range s.refused {
+		if sameRefusedEvidence(s.refused[i], index, record, basis) {
+			s.refused[i].Repeats++
+			return
+		}
+	}
+	s.refused = append(s.refused, RefusedEvidence{
+		Index:  index,
+		Record: append(json.RawMessage(nil), record...),
+		Batch:  batch,
+		Basis:  basis,
+	})
+}
+
+func sameRefusedEvidence(ev RefusedEvidence, index *uint64, record json.RawMessage, basis string) bool {
+	if (ev.Index == nil) != (index == nil) || ev.Basis != basis || !sameArrivalRecord(ev.Record, record) {
+		return false
+	}
+	return ev.Index == nil || *ev.Index == *index
+}
+
+func sameArrivalRecord(a, b json.RawMessage) bool {
+	aCompact, aErr := compactJSON(a)
+	bCompact, bErr := compactJSON(b)
+	if aErr != nil || bErr != nil {
+		return aErr != nil && bErr != nil && bytes.Equal(a, b)
+	}
+	return bytes.Equal(aCompact, bCompact)
+}
+
 // addDispute records contradictory content for an index. The verified
-// side stays the accepted one; each distinct later payload is kept
-// once, and repeated copies of the same payload only bump Repeats.
+// side stays the accepted one; each distinct later payload and basis is
+// kept once, and repeated copies only bump Repeats.
 func (s *Session) addDispute(index uint64, accepted Evidence, later Evidence) {
 	c := s.conflicts[index]
 	if c == nil {
@@ -173,7 +204,7 @@ func (s *Session) addDispute(index uint64, accepted Evidence, later Evidence) {
 		s.conflicts[index] = c
 	}
 	for i := range c.Disputed {
-		if bytes.Equal(c.Disputed[i].Record, later.Record) {
+		if bytes.Equal(c.Disputed[i].Record, later.Record) && c.Disputed[i].Basis == later.Basis {
 			c.Repeats++
 			return
 		}
@@ -287,7 +318,7 @@ func Resume(req Request, snap Snapshot) (*Session, error) {
 		verified:  map[uint64]Evidence{},
 		conflicts: map[uint64]*Conflict{},
 		dupes:     snap.Duplicates,
-		refused:   append([]RefusedEvidence(nil), snap.Refused...),
+		refused:   dedupeRefused(snap.Refused),
 	}
 	for i, ev := range snap.Verified {
 		if !s.wants(i) {
@@ -300,8 +331,61 @@ func Resume(req Request, snap Snapshot) (*Session, error) {
 		if !s.wants(c.Index) {
 			return nil, fmt.Errorf("snapshot contains conflict at index %d outside the required set", c.Index)
 		}
-		c.Disputed = append([]Evidence(nil), c.Disputed...)
+		c = dedupeConflict(c)
 		s.conflicts[c.Index] = &c
 	}
 	return s, nil
+}
+
+func dedupeRefused(in []RefusedEvidence) []RefusedEvidence {
+	if len(in) < 2 {
+		return in
+	}
+	out := make([]RefusedEvidence, 0, len(in))
+	for _, ev := range in {
+		found := false
+		for i := range out {
+			if sameRefusedEvidence(out[i], ev.Index, ev.Record, ev.Basis) {
+				out[i].Repeats += ev.Repeats + 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			if ev.Index != nil {
+				idx := *ev.Index
+				ev.Index = &idx
+			}
+			if ev.Record != nil {
+				ev.Record = append(json.RawMessage(nil), ev.Record...)
+			}
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func dedupeConflict(c Conflict) Conflict {
+	if len(c.Disputed) < 2 {
+		return c
+	}
+	out := make([]Evidence, 0, len(c.Disputed))
+	repeats := c.Repeats
+	for _, ev := range c.Disputed {
+		found := false
+		for i := range out {
+			if sameArrivalRecord(out[i].Record, ev.Record) && out[i].Basis == ev.Basis {
+				repeats++
+				found = true
+				break
+			}
+		}
+		if !found {
+			ev.Record = append(json.RawMessage(nil), ev.Record...)
+			out = append(out, ev)
+		}
+	}
+	c.Disputed = out
+	c.Repeats = repeats
+	return c
 }

@@ -51,7 +51,7 @@ go build -o vdex ./cmd/vdex
 ./vdex decisions -dir vdex-decisions
 ```
 
-输出行把所需集合明确划分为 `verified` / `missing` / `conflicted`：同一索引先到的可信记录与后到的不同内容会同时保留（含双方原文、到达批次和拒绝依据），重复补交的相同争议内容只计数、不重复堆积证据；只要存在缺失、矛盾或被拒材料，整体状态就不会显示 VALID。验证完整通过（VALID）退出码为 0；INCOMPLETE / INVALID 退出码为 1。
+输出行把所需集合明确划分为 `verified` / `missing` / `conflicted`：同一索引先到的可信记录与后到的不同内容会同时保留（含双方原文、到达批次和拒绝依据），重复补交的相同索引、原文和拒绝依据只保留首达证据并计数，不重复堆积证据；不同原文或不同拒绝依据仍独立保存。只要存在缺失、矛盾或被拒材料，整体状态就不会显示 VALID，补齐缺失项也不会清除争议。验证完整通过（VALID）退出码为 0；INCOMPLETE / INVALID 退出码为 1。
 
 ## 产物布局
 

@@ -264,6 +264,9 @@ func cmdVerify(args []string) error {
 		default:
 			fmt.Fprintf(os.Stderr, "  - batch %d: %s\n", e.Batch, e.Basis)
 		}
+		if e.Repeats > 0 {
+			fmt.Fprintf(os.Stderr, "      %d repeat delivery(ies) of identical refused evidence\n", e.Repeats)
+		}
 	}
 	if !st.Complete {
 		return errVerification

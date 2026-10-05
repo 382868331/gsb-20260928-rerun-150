@@ -48,16 +48,15 @@ func TestSessionReopenThenContradictionAcrossBatches(t *testing.T) {
 	if st.Complete {
 		t.Fatal("later contradiction must revoke the full-pass appearance")
 	}
-	if len(st.Refused) != 2 {
-		t.Fatalf("both invalid arrivals must be retained with their batches: %+v", st.Refused)
+	if len(st.Refused) != 1 || st.Refused[0].Batch != 3 || st.Refused[0].Repeats != 1 {
+		t.Fatalf("identical invalid arrivals must share one evidence record with repeat count: %+v", st.Refused)
 	}
-	for i, ev := range st.Refused {
-		if string(ev.Record) != `{"id":42}` || ev.Batch != uint64(i+3) {
-			t.Fatalf("disputed original and arrival batch must survive: %+v", ev)
-		}
-		if !strings.Contains(ev.Basis, "leaf verification failed") {
-			t.Fatalf("refusal basis must name the failed leaf check: %q", ev.Basis)
-		}
+	ev := st.Refused[0]
+	if string(ev.Record) != `{"id":42}` {
+		t.Fatalf("first disputed original must survive: %+v", ev)
+	}
+	if !strings.Contains(ev.Basis, "leaf verification failed") {
+		t.Fatalf("refusal basis must name the failed leaf check: %q", ev.Basis)
 	}
 	if len(st.Verified) != 3 {
 		t.Fatalf("the verified record set stays intact and auditable: %+v", st.Verified)
@@ -69,15 +68,14 @@ func TestSessionReopenThenContradictionAcrossBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	st3 := s3.Status()
-	if st3.Complete || len(st3.Refused) != 2 {
+	if st3.Complete || len(st3.Refused) != 1 || st3.Refused[0].Repeats != 1 {
 		t.Fatalf("conflict evidence must survive persistence: %+v", st3)
 	}
 }
 
 // Refused material (failing leaf proof) keeps its original content and
-// blocks a pass; repeat copies of the same invalid payload are stored
-// once as evidence per distinct arrival... here both arrivals remain
-// distinct batches but only one disputed entry exists per conflict rule.
+// blocks a pass; repeat copies of the same invalid payload and basis
+// are stored once with the first arrival batch and repeat count.
 func TestInvalidLaterMaterialIsRetainedNotLost(t *testing.T) {
 	dir, _, _ := sealTwoVersions(t)
 	store := NewStore(dir)
@@ -96,17 +94,91 @@ func TestInvalidLaterMaterialIsRetainedNotLost(t *testing.T) {
 	if st.Complete {
 		t.Fatal("invalid later material must block the pass")
 	}
+	if len(st.Refused) != 1 {
+		t.Fatalf("repeated refused evidence must be deduplicated: %+v", st.Refused)
+	}
+	ev := st.Refused[0]
+	if string(ev.Record) != `{"id":999}` || ev.Batch != 2 || ev.Repeats != 1 {
+		t.Fatalf("original, first batch and repeat count must be retained: %+v", ev)
+	}
+	if !strings.Contains(ev.Basis, "leaf verification failed") {
+		t.Fatalf("basis must name the leaf failure: %q", ev.Basis)
+	}
+}
+
+func TestRefusedEvidenceDedupSurvivesSaveResumeAndCompletion(t *testing.T) {
+	dir, _, _ := sealTwoVersions(t)
+	store := NewStore(dir)
+	ds := NewDecisionStore(filepath.Join(t.TempDir(), "decisions"))
+	req := sessionRequest(t, dir, 2, 0, 3)
+
+	s, _, err := ds.Open(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, _ := store.Extract(2, []uint64{0})
+	s.Add(good)
+
+	badA := good
+	badA.Entries = append([]Entry(nil), good.Entries...)
+	badA.Entries[0].Record = json.RawMessage(`{"id":999}`)
+	s.Add(badA)
+	s.Add(badA)
+	s.Add(badA)
+	if _, err := ds.Save(s); err != nil {
+		t.Fatal(err)
+	}
+
+	s, resumed, err := ds.Open(req)
+	if err != nil || !resumed {
+		t.Fatalf("conflicting partial decision must reopen: %v resumed=%v", err, resumed)
+	}
+	s.Add(badA)
+
+	badB := badA
+	badB.Entries = append([]Entry(nil), badA.Entries...)
+	badB.Entries[0].Record = json.RawMessage(`{"id":1000}`)
+	s.Add(badB)
+	s.Add(badB)
+
+	missing, _ := store.Extract(2, []uint64{3})
+	s.Add(missing)
+	st := s.Status()
+	if st.Complete {
+		t.Fatal("completing missing records must not clear refused evidence")
+	}
+	if len(st.Verified) != 2 {
+		t.Fatalf("trusted originals must remain verified: %+v", st.Verified)
+	}
 	if len(st.Refused) != 2 {
-		t.Fatalf("each refused arrival remains auditable with its batch: %+v", st.Refused)
+		t.Fatalf("distinct originals must remain independent: %+v", st.Refused)
 	}
-	for i, ev := range st.Refused {
-		if string(ev.Record) != `{"id":999}` || ev.Batch != uint64(i+2) {
-			t.Fatalf("original and batch must be retained: %+v", ev)
-		}
-		if !strings.Contains(ev.Basis, "leaf verification failed") {
-			t.Fatalf("basis must name the leaf failure: %q", ev.Basis)
-		}
+	if string(compactRecordForTest(t, st.Refused[0].Record)) != `{"id":999}` || st.Refused[0].Batch != 2 || st.Refused[0].Repeats != 3 {
+		t.Fatalf("first refused original and repeat count mismatch: %+v", st.Refused[0])
 	}
+	if string(compactRecordForTest(t, st.Refused[1].Record)) != `{"id":1000}` || st.Refused[1].Batch != 6 || st.Refused[1].Repeats != 1 {
+		t.Fatalf("second distinct refused original must be retained: %+v", st.Refused[1])
+	}
+	if _, err := ds.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err := ds.Open(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st = reopened.Status()
+	if st.Complete || len(st.Refused) != 2 || st.Refused[0].Repeats != 3 || st.Refused[1].Repeats != 1 {
+		t.Fatalf("deduplication boundaries must survive reopen: %+v", st)
+	}
+}
+
+func compactRecordForTest(t *testing.T, raw json.RawMessage) json.RawMessage {
+	t.Helper()
+	compact, err := compactJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compact
 }
 
 // Changing the request forms a new decision; the old request's material
